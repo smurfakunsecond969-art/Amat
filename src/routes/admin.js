@@ -1,13 +1,14 @@
 const express = require('express');
 const router = express.Router();
-const adminController = require('../controllers/adminController');
-const { requireAuth, requireRole } = require('../middleware/auth');
+const { requireAuth } = require('../middleware/auth');
+const { requireAdmin, listUsers, approveUser, rejectUser, changeRole } = require('../controllers/adminController');
 
-const adminOnly = [requireAuth, requireRole(['admin'])];
+// Semua route admin butuh login dulu, lalu cek role admin
+router.use(requireAuth, requireAdmin);
 
-router.get('/users', adminOnly, adminController.listUsers);
-router.patch('/users/:id/approve', adminOnly, adminController.approveUser);
-router.patch('/users/:id/reject', adminOnly, adminController.rejectUser);
-router.patch('/users/:id/role', adminOnly, adminController.changeUserRole);
+router.get('/users', listUsers);
+router.patch('/users/:id/approve', approveUser);
+router.patch('/users/:id/reject', rejectUser);
+router.patch('/users/:id/role', changeRole);
 
 module.exports = router;

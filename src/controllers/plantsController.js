@@ -2,14 +2,16 @@ const { supabase } = require('../db');
 const { computePlantStatus, computeLastUpdateMinutes } = require('../services/statusService');
 
 async function formatPlantSummary(plant) {
+  // Fetch device
   const { data: device } = await supabase
     .from('device')
     .select('id, device_code, last_seen_at, status_koneksi')
     .eq('tanaman_id', plant.id)
     .maybeSingle();
 
+  // Tidak ada fallback dummy — kalau belum ada sensor, moisture = null
   let latestMoisture = null;
-  let lastSeenAt = device?.last_seen_at || null;
+  let lastSeenAt = null; // hanya diisi dari data sensor nyata, bukan dari device.last_seen_at
 
   if (device) {
     const { data: latestReading } = await supabase
@@ -22,8 +24,50 @@ async function formatPlantSummary(plant) {
 
     if (latestReading) {
       latestMoisture = Number(latestReading.kelembaban_tanah);
-      if (!lastSeenAt) lastSeenAt = latestReading.recorded_at;
+      // last_seen_at hanya valid kalau ada sensor reading nyata
+      lastSeenAt = latestReading.recorded_at;
     }
+    // Kalau tidak ada sensor reading sama sekali, lastSeenAt tetap null
+    // — device terdaftar tapi belum pernah kirim data
+  }
+
+  // Fetch latest photo
+  let latestPhoto = null;
+  const { data: photoData } = await supabase
+    .from('plant_photos')
+    .select('id, photo_url, is_analysis_photo, catatan, created_at')
+    .eq('tanaman_id', plant.id)
+    .order('created_at', { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  if (photoData) {
+    latestPhoto = {
+      id: photoData.id,
+      url: photoData.photo_url,
+      isAnalysis: photoData.is_analysis_photo,
+      note: photoData.catatan,
+      uploadedAt: photoData.created_at,
+    };
+  }
+
+  // Fetch latest AI disease analysis
+  let latestAnalysis = null;
+  const { data: analysisData } = await supabase
+    .from('disease_analyses')
+    .select('id, status, hasil_analisis, analyzed_at')
+    .eq('tanaman_id', plant.id)
+    .order('analyzed_at', { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  if (analysisData) {
+    latestAnalysis = {
+      id: analysisData.id,
+      status: analysisData.status,
+      result: analysisData.hasil_analisis,
+      analyzedAt: analysisData.analyzed_at,
+    };
   }
 
   const computedStatus = computePlantStatus(latestMoisture, plant.threshold_min, lastSeenAt);
@@ -35,39 +79,40 @@ async function formatPlantSummary(plant) {
     type: plant.jenis_tanaman,
     emoji: plant.emoji || '🌱',
     startDate: plant.tanggal_tanam || plant.created_at?.split('T')[0] || new Date().toISOString().split('T')[0],
-    moisture: latestMoisture,
+    moisture: latestMoisture,           // null jika belum ada sensor/data
     moistureMin: Number(plant.threshold_min),
     moistureMax: Number(plant.threshold_max),
     status: computedStatus,
-    deviceId: device?.device_code || '-',
+    deviceId: device?.device_code || null,
     lastUpdate,
     autoWater: Boolean(plant.auto_water_mode),
-    ownerId: plant.user_id,
+    hasDevice: Boolean(device),
+    latestPhoto,
+    latestAnalysis,
   };
 }
 
-// ── Resolve target user ID berdasarkan role ──────────────────
-// - role 'user'           : selalu pakai req.user.id sendiri
-// - role 'worker'/'admin' : pakai targetUserId dari query/body, wajib diisi
-function resolveTargetUserId(req, source = 'query') {
-  const { role, id: callerId } = req.user;
-  if (role === 'user') return { targetId: callerId, error: null };
-
-  const rawId = source === 'query' ? req.query.userId : req.body.targetUserId;
-  if (!rawId) {
-    return {
-      targetId: null,
-      error: `Worker/admin wajib menyertakan ${source === 'query' ? 'userId' : 'targetUserId'}.`,
-    };
+/**
+ * Resolusi target user_id berdasarkan role:
+ *  - role 'user'          → selalu pakai id mereka sendiri
+ *  - role 'worker'/'admin' → ambil dari query param ?userId, wajib ada
+ */
+function resolveTargetUserId(req, res) {
+  if (req.user.role === 'user') {
+    return { targetId: req.user.id, ok: true };
   }
-  return { targetId: rawId, error: null };
+  const { userId } = req.query;
+  if (!userId) {
+    res.status(400).json({ error: 'Parameter userId wajib disertakan untuk role worker/admin.' });
+    return { ok: false };
+  }
+  return { targetId: userId, ok: true };
 }
 
-// ── GET /api/plants ──────────────────────────────────────────
 async function getPlants(req, res, next) {
   try {
-    const { targetId, error: idErr } = resolveTargetUserId(req, 'query');
-    if (idErr) return res.status(400).json({ error: idErr });
+    const { targetId, ok } = resolveTargetUserId(req, res);
+    if (!ok) return;
 
     const { data: plants, error } = await supabase
       .from('tanaman')
@@ -85,17 +130,18 @@ async function getPlants(req, res, next) {
   }
 }
 
-// ── GET /api/plants/:id ──────────────────────────────────────
 async function getPlantDetail(req, res, next) {
   try {
     const { id } = req.params;
+    const { targetId, ok } = resolveTargetUserId(req, res);
+    if (!ok) return;
 
-    // Cari tanaman; user hanya bisa akses miliknya, worker/admin bisa semua
-    let query = supabase.from('tanaman').select('*').eq('id', id);
-    if (req.user.role === 'user') {
-      query = query.eq('user_id', req.user.id);
-    }
-    const { data: plant, error } = await query.maybeSingle();
+    const { data: plant, error } = await supabase
+      .from('tanaman')
+      .select('*')
+      .eq('id', id)
+      .eq('user_id', targetId)
+      .maybeSingle();
 
     if (error || !plant) {
       return res.status(404).json({ error: 'Tanaman tidak ditemukan' });
@@ -103,30 +149,53 @@ async function getPlantDetail(req, res, next) {
 
     const baseSummary = await formatPlantSummary(plant);
 
+    // Fetch device
     const { data: device } = await supabase
       .from('device')
       .select('id')
       .eq('tanaman_id', plant.id)
       .maybeSingle();
 
-    let dailyHistory = [];
-    let weeklyHistory = [];
+    // Sensor history — hanya dari data nyata, tidak ada fallback dummy
+    let dailyHistory = null;
+    let weeklyHistory = null;
 
     if (device) {
-      const { data: readings } = await supabase
+      // Daily: ambil 7 pembacaan terakhir (per jam terakhir atau per titik)
+      const { data: dailyReadings } = await supabase
+        .from('sensor_readings')
+        .select('kelembaban_tanah, recorded_at')
+        .eq('device_id', device.id)
+        .order('recorded_at', { ascending: false })
+        .limit(7);
+
+      if (dailyReadings && dailyReadings.length > 0) {
+        dailyHistory = dailyReadings.map((r) => Number(r.kelembaban_tanah)).reverse();
+      }
+
+      // Weekly: ambil 28 pembacaan terakhir, rata-rata setiap 4 → 7 titik mingguan
+      const { data: weeklyReadings } = await supabase
         .from('sensor_readings')
         .select('kelembaban_tanah, recorded_at')
         .eq('device_id', device.id)
         .order('recorded_at', { ascending: false })
         .limit(28);
 
-      if (readings && readings.length > 0) {
-        const values = readings.map((r) => Number(r.kelembaban_tanah)).reverse();
-        dailyHistory = values.slice(-7);
-        weeklyHistory = values.slice(-7);
+      if (weeklyReadings && weeklyReadings.length >= 7) {
+        const values = weeklyReadings.map((r) => Number(r.kelembaban_tanah)).reverse();
+        // Bagi jadi 7 segmen, ambil rata-rata tiap segmen
+        const segSize = Math.floor(values.length / 7);
+        weeklyHistory = Array.from({ length: 7 }, (_, i) => {
+          const seg = values.slice(i * segSize, (i + 1) * segSize);
+          const avg = seg.reduce((s, v) => s + v, 0) / seg.length;
+          return Math.round(avg * 10) / 10;
+        });
+      } else if (weeklyReadings && weeklyReadings.length > 0) {
+        weeklyHistory = weeklyReadings.map((r) => Number(r.kelembaban_tanah)).reverse();
       }
     }
 
+    // Fetch water logs (last 6)
     const { data: waterLogs } = await supabase
       .from('irrigation_logs')
       .select('id, trigger_type, waktu_mulai, kelembaban_awal, kelembaban_akhir, durasi_detik, dipicu_oleh_user_id, users(nama)')
@@ -138,15 +207,18 @@ async function getPlantDetail(req, res, next) {
       id: log.id,
       type: log.trigger_type,
       time: log.waktu_mulai,
-      before: log.kelembaban_awal != null ? Number(log.kelembaban_awal) : null,
-      after: log.kelembaban_akhir != null ? Number(log.kelembaban_akhir) : null,
-      duration: log.durasi_detik != null ? Math.round(log.durasi_detik / 60) : null,
+      before: log.kelembaban_awal !== null ? Number(log.kelembaban_awal) : null,
+      after: log.kelembaban_akhir !== null ? Number(log.kelembaban_akhir) : null,
+      duration: log.durasi_detik !== null ? Math.round(log.durasi_detik / 60) : null,
       by: log.users?.nama || (log.trigger_type === 'manual' ? req.user.nama : undefined),
     }));
 
     res.json({
       ...baseSummary,
-      moistureHistory: { daily: dailyHistory, weekly: weeklyHistory },
+      moistureHistory: {
+        daily: dailyHistory,     // null jika tidak ada data
+        weekly: weeklyHistory,   // null jika tidak ada data
+      },
       waterLog: formattedWaterLog,
     });
   } catch (err) {
@@ -154,67 +226,52 @@ async function getPlantDetail(req, res, next) {
   }
 }
 
-// ── POST /api/plants ─────────────────────────────────────────
-// Role 'user' tidak diizinkan. Worker/admin wajib kirim targetUserId.
 async function createPlant(req, res, next) {
   try {
-    if (req.user.role === 'user') {
-      return res.status(403).json({ error: 'Role user tidak bisa menambah tanaman. Hubungi worker atau admin.' });
-    }
+    const { targetId, ok } = resolveTargetUserId(req, res);
+    if (!ok) return;
 
-    const { name, type, emoji, deviceId, moistureMin, moistureMax, targetUserId } = req.body;
+    const { name, type, emoji, deviceId, moistureMin, moistureMax } = req.body;
 
     if (!name || !type) {
       return res.status(400).json({ error: 'Nama dan jenis tanaman wajib diisi' });
     }
-    if (!targetUserId) {
-      return res.status(400).json({ error: 'targetUserId wajib diisi (tanaman dibuat atas nama user mana?)' });
-    }
-
-    // Pastikan targetUserId adalah user approved
-    const { data: targetUser } = await supabase
-      .from('users')
-      .select('id, role, approval_status')
-      .eq('id', targetUserId)
-      .maybeSingle();
-
-    if (!targetUser || targetUser.approval_status !== 'approved' || targetUser.role !== 'user') {
-      return res.status(400).json({ error: 'targetUserId tidak valid atau bukan akun user yang disetujui.' });
-    }
 
     const { data: newPlant, error: plantError } = await supabase
       .from('tanaman')
-      .insert([{
-        user_id: targetUserId,          // pemilik tanaman = user yang dipilih
-        created_by_worker_id: req.user.id, // yang input = worker/admin
-        nama: name.trim(),
-        jenis_tanaman: type.trim(),
-        emoji: emoji || '🌱',
-        threshold_min: moistureMin ?? 50,
-        threshold_max: moistureMax ?? 80,
-        auto_water_mode: false,
-        status: 'aktif',
-      }])
+      .insert([
+        {
+          user_id: targetId,
+          nama: name.trim(),
+          jenis_tanaman: type.trim(),
+          emoji: emoji || '🌱',
+          threshold_min: moistureMin ?? 50,
+          threshold_max: moistureMax ?? 80,
+          auto_water_mode: false,
+          status: 'aktif',
+        },
+      ])
       .select()
       .single();
 
     if (plantError) throw plantError;
 
-    const deviceCode = (deviceId && deviceId.trim())
-      ? deviceId.trim()
-      : `DEV-${newPlant.id.slice(0, 6).toUpperCase()}`;
+    // Buat device code hanya jika deviceId diberikan
+    if (deviceId && deviceId.trim()) {
+      const { error: deviceError } = await supabase
+        .from('device')
+        .insert([
+          {
+            tanaman_id: newPlant.id,
+            device_code: deviceId.trim(),
+            tipe_device: 'ESP32',
+            status_koneksi: 'perlu_dicek',
+          },
+        ]);
 
-    const { error: deviceError } = await supabase
-      .from('device')
-      .insert([{
-        tanaman_id: newPlant.id,
-        device_code: deviceCode,
-        tipe_device: 'ESP32',
-        status_koneksi: 'perlu_dicek',
-      }]);
-
-    if (deviceError && deviceError.code !== '23505') {
-      console.warn('Device insert warning:', deviceError.message);
+      if (deviceError && deviceError.code !== '23505') {
+        console.warn('Device insert warning:', deviceError.message);
+      }
     }
 
     const result = await formatPlantSummary(newPlant);
@@ -224,33 +281,37 @@ async function createPlant(req, res, next) {
   }
 }
 
-// ── PUT /api/plants/:id ──────────────────────────────────────
 async function updatePlant(req, res, next) {
   try {
     const { id } = req.params;
+    const { targetId, ok } = resolveTargetUserId(req, res);
+    if (!ok) return;
+
     const { name, type, emoji, deviceId, moistureMin, moistureMax } = req.body;
 
-    // user hanya bisa update miliknya; worker/admin bisa update semua
-    let query = supabase.from('tanaman').update({
-      nama: name?.trim(),
-      jenis_tanaman: type?.trim(),
-      emoji: emoji || '🌱',
-      threshold_min: moistureMin,
-      threshold_max: moistureMax,
-    }).eq('id', id);
-
-    if (req.user.role === 'user') {
-      query = query.eq('user_id', req.user.id);
-    }
-
-    const { data: updatedPlant, error } = await query.select().single();
+    const { data: updatedPlant, error } = await supabase
+      .from('tanaman')
+      .update({
+        nama: name?.trim(),
+        jenis_tanaman: type?.trim(),
+        emoji: emoji || '🌱',
+        threshold_min: moistureMin,
+        threshold_max: moistureMax,
+      })
+      .eq('id', id)
+      .eq('user_id', targetId)
+      .select()
+      .single();
 
     if (error || !updatedPlant) {
       return res.status(404).json({ error: 'Tanaman tidak ditemukan atau gagal diperbarui' });
     }
 
-    if (deviceId) {
-      await supabase.from('device').update({ device_code: deviceId.trim() }).eq('tanaman_id', id);
+    if (deviceId && deviceId.trim()) {
+      await supabase
+        .from('device')
+        .update({ device_code: deviceId.trim() })
+        .eq('tanaman_id', id);
     }
 
     const result = await formatPlantSummary(updatedPlant);
@@ -260,17 +321,18 @@ async function updatePlant(req, res, next) {
   }
 }
 
-// ── DELETE /api/plants/:id ───────────────────────────────────
 async function deletePlant(req, res, next) {
   try {
     const { id } = req.params;
+    const { targetId, ok } = resolveTargetUserId(req, res);
+    if (!ok) return;
 
-    let query = supabase.from('tanaman').delete().eq('id', id);
-    if (req.user.role === 'user') {
-      query = query.eq('user_id', req.user.id);
-    }
+    const { error } = await supabase
+      .from('tanaman')
+      .delete()
+      .eq('id', id)
+      .eq('user_id', targetId);
 
-    const { error } = await query;
     if (error) throw error;
 
     res.json({ message: 'Tanaman berhasil dihapus' });
@@ -279,27 +341,34 @@ async function deletePlant(req, res, next) {
   }
 }
 
-// ── POST /api/plants/:id/water ───────────────────────────────
 async function triggerWatering(req, res, next) {
   try {
     const { id } = req.params;
+    const { targetId, ok } = resolveTargetUserId(req, res);
+    if (!ok) return;
 
-    // user hanya bisa siram miliknya; worker/admin bisa siram semua
-    let query = supabase.from('tanaman').select('id, threshold_max').eq('id', id);
-    if (req.user.role === 'user') query = query.eq('user_id', req.user.id);
-    const { data: plant, error: plantError } = await query.maybeSingle();
+    const { data: plant, error: plantError } = await supabase
+      .from('tanaman')
+      .select('id, threshold_max')
+      .eq('id', id)
+      .eq('user_id', targetId)
+      .maybeSingle();
 
     if (plantError || !plant) {
       return res.status(404).json({ error: 'Tanaman tidak ditemukan' });
     }
 
     const { data: device } = await supabase
-      .from('device').select('id').eq('tanaman_id', id).maybeSingle();
+      .from('device')
+      .select('id')
+      .eq('tanaman_id', id)
+      .maybeSingle();
 
     if (!device) {
       return res.status(400).json({ error: 'Belum ada perangkat IoT yang terhubung ke tanaman ini' });
     }
 
+    // Ambil moisture terkini — null jika belum ada data sensor
     const { data: latestReading } = await supabase
       .from('sensor_readings')
       .select('kelembaban_tanah')
@@ -312,38 +381,58 @@ async function triggerWatering(req, res, next) {
 
     const { data: command, error: cmdError } = await supabase
       .from('device_commands')
-      .insert([{ device_id: device.id, command: 'siram_mulai', status: 'pending' }])
+      .insert([
+        {
+          device_id: device.id,
+          command: 'siram_mulai',
+          status: 'pending',
+        },
+      ])
       .select()
       .single();
 
     if (cmdError) throw cmdError;
 
-    await supabase.from('irrigation_logs').insert([{
-      tanaman_id: plant.id,
-      device_id: device.id,
-      trigger_type: 'manual',
-      waktu_mulai: new Date().toISOString(),
-      kelembaban_awal: currentMoisture,
-      status: 'berjalan',
-      dipicu_oleh_user_id: req.user.id,
-    }]);
+    const { error: logError } = await supabase
+      .from('irrigation_logs')
+      .insert([
+        {
+          tanaman_id: plant.id,
+          device_id: device.id,
+          trigger_type: 'manual',
+          waktu_mulai: new Date().toISOString(),
+          kelembaban_awal: currentMoisture,
+          status: 'berjalan',
+          dipicu_oleh_user_id: req.user.id,
+        },
+      ]);
 
-    res.json({ message: 'Perintah siram terkirim. Menyiram...', commandId: command.id });
+    if (logError) console.warn('Irrigation log insert warning:', logError.message);
+
+    res.json({
+      message: 'Perintah siram terkirim. Menyiram...',
+      commandId: command.id,
+    });
   } catch (err) {
     next(err);
   }
 }
 
-// ── PATCH /api/plants/:id/auto-water ────────────────────────
 async function toggleAutoWater(req, res, next) {
   try {
     const { id } = req.params;
+    const { targetId, ok } = resolveTargetUserId(req, res);
+    if (!ok) return;
+
     const { enabled } = req.body;
 
-    let query = supabase.from('tanaman').update({ auto_water_mode: Boolean(enabled) }).eq('id', id);
-    if (req.user.role === 'user') query = query.eq('user_id', req.user.id);
-
-    const { data: plant, error } = await query.select().single();
+    const { data: plant, error } = await supabase
+      .from('tanaman')
+      .update({ auto_water_mode: Boolean(enabled) })
+      .eq('id', id)
+      .eq('user_id', targetId)
+      .select()
+      .single();
 
     if (error || !plant) {
       return res.status(404).json({ error: 'Tanaman tidak ditemukan' });
@@ -359,35 +448,71 @@ async function toggleAutoWater(req, res, next) {
   }
 }
 
-// ── GET /api/plants/:id/history ──────────────────────────────
 async function getPlantChartHistory(req, res, next) {
   try {
     const { id } = req.params;
     const { range = 'daily' } = req.query;
+    const { targetId, ok } = resolveTargetUserId(req, res);
+    if (!ok) return;
 
-    const { data: device } = await supabase
-      .from('device').select('id').eq('tanaman_id', id).maybeSingle();
+    // Verifikasi kepemilikan tanaman
+    const { data: plant } = await supabase
+      .from('tanaman')
+      .select('id')
+      .eq('id', id)
+      .eq('user_id', targetId)
+      .maybeSingle();
 
-    if (!device) {
-      return res.json({ labels: ['Sen', 'Sel', 'Rab', 'Kam', 'Jum', 'Sab', 'Min'], values: [] });
+    if (!plant) {
+      return res.status(404).json({ error: 'Tanaman tidak ditemukan' });
     }
 
+    const { data: device } = await supabase
+      .from('device')
+      .select('id')
+      .eq('tanaman_id', id)
+      .maybeSingle();
+
+    // Tidak ada device → kembalikan data kosong, bukan dummy
+    if (!device) {
+      return res.json({ labels: [], values: [], hasData: false });
+    }
+
+    const limit = range === 'weekly' ? 28 : 7;
     const { data: readings } = await supabase
       .from('sensor_readings')
       .select('kelembaban_tanah, recorded_at')
       .eq('device_id', device.id)
       .order('recorded_at', { ascending: false })
-      .limit(7);
+      .limit(limit);
 
-    const labels = range === 'daily'
-      ? ['Sen', 'Sel', 'Rab', 'Kam', 'Jum', 'Sab', 'Min']
-      : ['M1', 'M2', 'M3', 'M4', 'M5', 'M6', 'M7'];
+    if (!readings || readings.length === 0) {
+      return res.json({ labels: [], values: [], hasData: false });
+    }
 
-    const values = readings && readings.length > 0
-      ? readings.map((r) => Number(r.kelembaban_tanah)).reverse()
-      : [];
+    let labels;
+    let values;
 
-    res.json({ labels, values });
+    if (range === 'weekly' && readings.length >= 7) {
+      // Bagi ke 7 segmen, rata-rata per segmen
+      const reversed = readings.map((r) => Number(r.kelembaban_tanah)).reverse();
+      const segSize = Math.floor(reversed.length / 7);
+      values = Array.from({ length: 7 }, (_, i) => {
+        const seg = reversed.slice(i * segSize, (i + 1) * segSize);
+        return Math.round((seg.reduce((s, v) => s + v, 0) / seg.length) * 10) / 10;
+      });
+      labels = ['M1', 'M2', 'M3', 'M4', 'M5', 'M6', 'M7'];
+    } else {
+      // Daily: ambil dari recorded_at untuk label hari
+      const sorted = [...readings].reverse();
+      values = sorted.map((r) => Number(r.kelembaban_tanah));
+      labels = sorted.map((r) => {
+        const d = new Date(r.recorded_at);
+        return d.toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit' });
+      });
+    }
+
+    res.json({ labels, values, hasData: true });
   } catch (err) {
     next(err);
   }

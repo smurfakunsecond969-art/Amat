@@ -2,22 +2,26 @@
   * Hitung status 'good' atau 'warning' secara real-time.
   * status = 'warning' jika:
   *   1. kelembaban < threshold_min
-  *   2. last_seen_at tidak ada atau lebih tua dari 30 menit
+  *   2. last_seen_at tidak ada (belum pernah sync) — status 'no_data'
+  *   3. last_seen_at lebih tua dari 30 menit
   */
 function computePlantStatus(moisture, thresholdMin, lastSeenAt) {
-  if (moisture !== null && moisture !== undefined && Number(moisture) < Number(thresholdMin)) {
-    return 'warning';
-  }
-
+  // Belum pernah ada data sensor sama sekali
   if (!lastSeenAt) {
-    return 'warning';
+    return 'no_data';
   }
 
   const now = new Date();
   const lastSeen = new Date(lastSeenAt);
   const diffMinutes = (now.getTime() - lastSeen.getTime()) / (1000 * 60);
 
+  // Device offline / terlalu lama tidak kirim data
   if (diffMinutes > 30) {
+    return 'warning';
+  }
+
+  // Kelembaban di bawah threshold minimum
+  if (moisture !== null && moisture !== undefined && Number(moisture) < Number(thresholdMin)) {
     return 'warning';
   }
 
@@ -25,11 +29,10 @@ function computePlantStatus(moisture, thresholdMin, lastSeenAt) {
 }
 
 /**
-  * Hitung menit sejak lastSeenAt.
-  * Return null jika lastSeenAt tidak tersedia (belum pernah sync).
+  * Hitung menit sejak lastSeenAt
   */
 function computeLastUpdateMinutes(lastSeenAt) {
-  if (!lastSeenAt) return null;
+  if (!lastSeenAt) return 999;
   const now = new Date();
   const lastSeen = new Date(lastSeenAt);
   const diffMinutes = Math.floor((now.getTime() - lastSeen.getTime()) / (1000 * 60));

@@ -4,7 +4,7 @@ async function updateProfile(req, res, next) {
   try {
     const { name, email, role } = req.body;
 
-    const validRoles = ['owner', 'admin', 'viewer'];
+    const validRoles = ['user', 'worker', 'admin'];
     const updateData = {};
 
     if (name) updateData.nama = name.trim();

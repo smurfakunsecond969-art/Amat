@@ -2,8 +2,6 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const { supabase } = require('../db');
 
-const SUPPORT_PHONE = '085215002047';
-
 function formatUserResponse(user) {
   return {
     id: user.id,
@@ -22,12 +20,9 @@ function generateToken(userId) {
   return jwt.sign({ id: userId }, process.env.JWT_SECRET, { expiresIn: '7d' });
 }
 
-// ── POST /api/auth/register ──────────────────────────────────
-// Role dipaksa 'user', approval_status = 'pending'.
-// Tidak return token — return pesan tunggu persetujuan.
 async function register(req, res, next) {
   try {
-    const { name, phone, email, password } = req.body;
+    const { name, phone, email, password, role } = req.body;
 
     if (!name || !email || !password) {
       return res.status(400).json({ error: 'Nama, email, dan kata sandi wajib diisi' });
@@ -44,6 +39,8 @@ async function register(req, res, next) {
     }
 
     const password_hash = await bcrypt.hash(password, 10);
+    const validRoles = ['user', 'worker', 'admin'];
+    const userRole = validRoles.includes(role) ? role : 'user';
 
     const { data: newUser, error } = await supabase
       .from('users')
@@ -53,8 +50,8 @@ async function register(req, res, next) {
           email: email.toLowerCase().trim(),
           password_hash,
           telepon: phone ? phone.trim() : null,
-          role: 'user',              // selalu 'user' saat register
-          approval_status: 'pending', // harus disetujui admin dulu
+          role: userRole,
+          approval_status: 'pending',
         },
       ])
       .select()
@@ -62,17 +59,17 @@ async function register(req, res, next) {
 
     if (error) throw error;
 
-    // Tidak kasih token — akun belum disetujui
+    // Return pesan saja — akun perlu disetujui admin sebelum bisa login.
+    // supportPhone diambil dari env agar bisa dikonfigurasi tanpa deploy ulang.
     res.status(201).json({
-      message: 'Akun berhasil dibuat, menunggu persetujuan admin.',
-      supportPhone: SUPPORT_PHONE,
+      message: 'Pendaftaran berhasil. Akunmu sedang menunggu persetujuan admin.',
+      supportPhone: process.env.SUPPORT_PHONE || '',
     });
   } catch (err) {
     next(err);
   }
 }
 
-// ── POST /api/auth/login ─────────────────────────────────────
 async function login(req, res, next) {
   try {
     const { email, password } = req.body;
@@ -96,12 +93,19 @@ async function login(req, res, next) {
       return res.status(400).json({ error: 'Email atau kata sandi salah' });
     }
 
-    // Cek approval setelah password cocok
-    if (user.approval_status !== 'approved') {
+    // Cek status persetujuan akun
+    if (user.approval_status === 'pending') {
       return res.status(403).json({
         error: 'pending_approval',
-        message: 'Akun kamu belum disetujui. Hubungi Customer Service untuk mengaktifkan.',
-        supportPhone: SUPPORT_PHONE,
+        message: 'Akunmu sedang menunggu persetujuan admin.',
+        supportPhone: process.env.SUPPORT_PHONE || '',
+      });
+    }
+    if (user.approval_status === 'rejected') {
+      return res.status(403).json({
+        error: 'account_rejected',
+        message: 'Akunmu telah ditolak. Hubungi admin untuk informasi lebih lanjut.',
+        supportPhone: process.env.SUPPORT_PHONE || '',
       });
     }
 
@@ -112,26 +116,23 @@ async function login(req, res, next) {
   }
 }
 
-// ── GET /api/auth/me ─────────────────────────────────────────
 async function getMe(req, res) {
   res.json({ user: formatUserResponse(req.user) });
 }
 
-// ── POST /api/auth/forgot-password ──────────────────────────
 async function forgotPassword(req, res, next) {
   try {
     const { email } = req.body;
     if (!email) {
       return res.status(400).json({ error: 'Email wajib diisi' });
     }
-    // Stub — belum ada email service
+    // Stub response for prototype
     res.json({ message: 'Jika email terdaftar, instruksi reset kata sandi telah dikirim.' });
   } catch (err) {
     next(err);
   }
 }
 
-// ── POST /api/auth/change-password ──────────────────────────
 async function changePassword(req, res, next) {
   try {
     const { oldPassword, newPassword } = req.body;
@@ -159,4 +160,10 @@ async function changePassword(req, res, next) {
   }
 }
 
-module.exports = { register, login, getMe, forgotPassword, changePassword };
+module.exports = {
+  register,
+  login,
+  getMe,
+  forgotPassword,
+  changePassword,
+};

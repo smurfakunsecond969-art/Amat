@@ -1,8 +1,8 @@
 const express = require('express');
 const router = express.Router();
-const usersController = require('../controllers/usersController');
-const { requireAuth, requireRole } = require('../middleware/auth');
+const { requireAuth } = require('../middleware/auth');
+const { getManagedUsers } = require('../controllers/usersController');
 
-router.get('/managed', requireAuth, requireRole(['worker', 'admin']), usersController.getManagedUsers);
+router.get('/managed', requireAuth, getManagedUsers);
 
 module.exports = router;

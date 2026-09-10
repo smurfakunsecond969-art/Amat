@@ -9,7 +9,11 @@ CREATE EXTENSION IF NOT EXISTS "pgcrypto";
 -- ── Enum Types ───────────────────────────────────────────────
 
 DO $$ BEGIN
-  CREATE TYPE user_role AS ENUM ('owner', 'admin', 'viewer');
+  CREATE TYPE user_role AS ENUM ('user', 'worker', 'admin');
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+
+DO $$ BEGIN
+  CREATE TYPE approval_status_enum AS ENUM ('pending', 'approved', 'rejected');
 EXCEPTION WHEN duplicate_object THEN NULL; END $$;
 
 DO $$ BEGIN
@@ -39,16 +43,17 @@ EXCEPTION WHEN duplicate_object THEN NULL; END $$;
 -- ── Tabel: users ─────────────────────────────────────────────
 
 CREATE TABLE IF NOT EXISTS users (
-  id            UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
-  nama          VARCHAR(100) NOT NULL,
-  email         VARCHAR(255) UNIQUE NOT NULL,
-  password_hash VARCHAR      NOT NULL,
-  telepon       VARCHAR(20),
-  role          user_role    NOT NULL DEFAULT 'viewer',
+  id              UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+  nama            VARCHAR(100) NOT NULL,
+  email           VARCHAR(255) UNIQUE NOT NULL,
+  password_hash   VARCHAR      NOT NULL,
+  telepon         VARCHAR(20),
+  role            user_role    NOT NULL DEFAULT 'user',
+  approval_status approval_status_enum NOT NULL DEFAULT 'pending',
   notif_watering  BOOLEAN DEFAULT true,
   notif_device    BOOLEAN DEFAULT true,
   notif_report    BOOLEAN DEFAULT false,
-  created_at    TIMESTAMP    DEFAULT NOW()
+  created_at      TIMESTAMP    DEFAULT NOW()
 );
 
 -- ── Tabel: lahan ─────────────────────────────────────────────
@@ -133,6 +138,10 @@ CREATE TABLE IF NOT EXISTS device_commands (
 -- ── Indexes untuk performa ───────────────────────────────────
 
 CREATE INDEX IF NOT EXISTS idx_sensor_device_time   ON sensor_readings(device_id, recorded_at DESC);
+<<<<<<< HEAD
+=======
+CREATE INDEX IF NOT EXISTS idx_users_approval       ON users(approval_status);
+>>>>>>> b8e9e8a1e0a1aff09b29ccce3cb7ff5794e9c8bb
 CREATE INDEX IF NOT EXISTS idx_tanaman_user         ON tanaman(user_id);
 CREATE INDEX IF NOT EXISTS idx_tanaman_status       ON tanaman(user_id, status);
 CREATE INDEX IF NOT EXISTS idx_device_tanaman       ON device(tanaman_id);

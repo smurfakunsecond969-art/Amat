@@ -9,10 +9,20 @@ const profileRoutes = require('./routes/profile');
 const deviceRoutes  = require('./routes/device');
 const adminRoutes   = require('./routes/admin');
 const usersRoutes   = require('./routes/users');
+const aiRoutes      = require('./routes/ai');
 const errorHandler  = require('./middleware/errorHandler');
+
+const path = require('path');
+const fs = require('fs');
 
 const app  = express();
 const PORT = process.env.PORT || 3001;
+
+// ── Ensure uploads directory exists ──
+const uploadsDir = path.join(__dirname, '../uploads');
+if (!fs.existsSync(uploadsDir)) {
+  fs.mkdirSync(uploadsDir, { recursive: true });
+}
 
 // ── Middleware ────────────────────────────────────────────
 app.use(cors({
@@ -24,6 +34,7 @@ app.use(cors({
   credentials: true,
 }));
 app.use(express.json());
+app.use('/uploads', express.static(uploadsDir));
 
 // ── Health check ──────────────────────────────────────────
 app.get('/api/health', (_req, res) => {
@@ -33,11 +44,12 @@ app.get('/api/health', (_req, res) => {
 // ── Routes ────────────────────────────────────────────────
 app.use('/api/auth',    authRoutes);
 app.use('/api/plants',  plantsRoutes);
-app.use('/api/history', historyRoutes);
+app.use('/api/plants',  aiRoutes);      // foto analisis: /api/plants/:id/photos/*
 app.use('/api/profile', profileRoutes);
-app.use('/api/device',  deviceRoutes);
 app.use('/api/admin',   adminRoutes);
 app.use('/api/users',   usersRoutes);
+app.use('/api/ai',      aiRoutes);      // chat Taku: /api/ai/chat
+
 
 // ── 404 catch ─────────────────────────────────────────────
 app.use((_req, res) => {

@@ -1,13 +1,27 @@
 const { supabase } = require('../db');
 
-// ── GET /api/admin/users?status=pending|approved|rejected|all ──
+/**
+ * Middleware: hanya admin yang boleh akses
+ */
+function requireAdmin(req, res, next) {
+  if (req.user?.role !== 'admin') {
+    return res.status(403).json({ error: 'Akses ditolak. Hanya admin yang diizinkan.' });
+  }
+  next();
+}
+
+/**
+ * GET /api/admin/users?status=pending|approved|rejected|all
+ * List semua user beserta status persetujuan
+ */
 async function listUsers(req, res, next) {
   try {
     const { status = 'pending' } = req.query;
 
     let query = supabase
       .from('users')
-      .select('id, nama, email, telepon, role, approval_status, approved_at, created_at')
+      .select('id, nama, email, telepon, role, approval_status, created_at')
+      .neq('id', req.user.id) // jangan tampilkan diri sendiri
       .order('created_at', { ascending: false });
 
     if (status !== 'all') {
@@ -17,35 +31,33 @@ async function listUsers(req, res, next) {
     const { data: users, error } = await query;
     if (error) throw error;
 
-    res.json(
-      (users || []).map((u) => ({
-        id: u.id,
-        name: u.nama,
-        email: u.email,
-        phone: u.telepon || '',
-        role: u.role,
-        approvalStatus: u.approval_status,
-        approvedAt: u.approved_at,
-        createdAt: u.created_at,
-      }))
-    );
+    const formatted = (users || []).map((u) => ({
+      id: u.id,
+      name: u.nama,
+      email: u.email,
+      phone: u.telepon || '',
+      role: u.role,
+      approvalStatus: u.approval_status,
+      createdAt: u.created_at,
+    }));
+
+    res.json(formatted);
   } catch (err) {
     next(err);
   }
 }
 
-// ── PATCH /api/admin/users/:id/approve ──
+/**
+ * PATCH /api/admin/users/:id/approve
+ * Setujui akun user
+ */
 async function approveUser(req, res, next) {
   try {
     const { id } = req.params;
 
     const { data: user, error } = await supabase
       .from('users')
-      .update({
-        approval_status: 'approved',
-        approved_by: req.user.id,
-        approved_at: new Date().toISOString(),
-      })
+      .update({ approval_status: 'approved' })
       .eq('id', id)
       .select('id, nama, email, role, approval_status')
       .single();
@@ -55,15 +67,24 @@ async function approveUser(req, res, next) {
     }
 
     res.json({
-      message: `Akun ${user.nama} berhasil disetujui.`,
-      user: { id: user.id, name: user.nama, email: user.email, role: user.role, approvalStatus: user.approval_status },
+      message: `Akun ${user.nama} berhasil disetujui`,
+      user: {
+        id: user.id,
+        name: user.nama,
+        email: user.email,
+        role: user.role,
+        approvalStatus: user.approval_status,
+      },
     });
   } catch (err) {
     next(err);
   }
 }
 
-// ── PATCH /api/admin/users/:id/reject ──
+/**
+ * PATCH /api/admin/users/:id/reject
+ * Tolak akun user
+ */
 async function rejectUser(req, res, next) {
   try {
     const { id } = req.params;
@@ -72,40 +93,7 @@ async function rejectUser(req, res, next) {
       .from('users')
       .update({ approval_status: 'rejected' })
       .eq('id', id)
-      .select('id, nama, email')
-      .single();
-
-    if (error || !user) {
-      return res.status(404).json({ error: 'Pengguna tidak ditemukan' });
-    }
-
-    res.json({ message: `Akun ${user.nama} ditolak.` });
-  } catch (err) {
-    next(err);
-  }
-}
-
-// ── PATCH /api/admin/users/:id/role ──
-async function changeUserRole(req, res, next) {
-  try {
-    const { id } = req.params;
-    const { role } = req.body;
-
-    const validRoles = ['user', 'worker', 'admin'];
-    if (!validRoles.includes(role)) {
-      return res.status(400).json({ error: `Role tidak valid. Gunakan: ${validRoles.join(', ')}` });
-    }
-
-    // Jangan bisa downgrade diri sendiri
-    if (id === req.user.id) {
-      return res.status(400).json({ error: 'Tidak bisa mengubah role akun sendiri.' });
-    }
-
-    const { data: user, error } = await supabase
-      .from('users')
-      .update({ role })
-      .eq('id', id)
-      .select('id, nama, email, role')
+      .select('id, nama, email, role, approval_status')
       .single();
 
     if (error || !user) {
@@ -113,12 +101,64 @@ async function changeUserRole(req, res, next) {
     }
 
     res.json({
-      message: `Role ${user.nama} diubah menjadi ${role}.`,
-      user: { id: user.id, name: user.nama, email: user.email, role: user.role },
+      message: `Akun ${user.nama} ditolak`,
+      user: {
+        id: user.id,
+        name: user.nama,
+        email: user.email,
+        role: user.role,
+        approvalStatus: user.approval_status,
+      },
     });
   } catch (err) {
     next(err);
   }
 }
 
-module.exports = { listUsers, approveUser, rejectUser, changeUserRole };
+/**
+ * PATCH /api/admin/users/:id/role
+ * Ubah role user
+ */
+async function changeRole(req, res, next) {
+  try {
+    const { id } = req.params;
+    const { role } = req.body;
+
+    const validRoles = ['user', 'worker', 'admin'];
+    if (!role || !validRoles.includes(role)) {
+      return res.status(400).json({ error: `Role tidak valid. Pilihan: ${validRoles.join(', ')}` });
+    }
+
+    const { data: user, error } = await supabase
+      .from('users')
+      .update({ role })
+      .eq('id', id)
+      .select('id, nama, email, role, approval_status')
+      .single();
+
+    if (error || !user) {
+      return res.status(404).json({ error: 'Pengguna tidak ditemukan' });
+    }
+
+    res.json({
+      message: `Role ${user.nama} diubah ke ${role}`,
+      user: {
+        id: user.id,
+        name: user.nama,
+        email: user.email,
+        role: user.role,
+        approvalStatus: user.approval_status,
+      },
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+
+module.exports = {
+  requireAdmin,
+  listUsers,
+  approveUser,
+  rejectUser,
+  changeRole,
+};
