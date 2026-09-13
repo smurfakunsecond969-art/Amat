@@ -26,4 +26,7 @@ router.get('/:id/photos',          requireAuth, aiController.getPlantPhotos);
 router.post('/chat',         requireAuth, aiController.chatWithTaku);
 router.get('/chat/history',  requireAuth, aiController.getChatHistory);
 
+// ── Taku active assistant command ──
+router.post('/taku/command', requireAuth, aiController.takuCommand);
+
 module.exports = router;
