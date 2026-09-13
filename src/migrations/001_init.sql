@@ -138,7 +138,10 @@ CREATE TABLE IF NOT EXISTS device_commands (
 -- ── Indexes untuk performa ───────────────────────────────────
 
 CREATE INDEX IF NOT EXISTS idx_sensor_device_time   ON sensor_readings(device_id, recorded_at DESC);
+<<<<<<< HEAD
+=======
 CREATE INDEX IF NOT EXISTS idx_users_approval       ON users(approval_status);
+>>>>>>> b8e9e8a1e0a1aff09b29ccce3cb7ff5794e9c8bb
 CREATE INDEX IF NOT EXISTS idx_tanaman_user         ON tanaman(user_id);
 CREATE INDEX IF NOT EXISTS idx_tanaman_status       ON tanaman(user_id, status);
 CREATE INDEX IF NOT EXISTS idx_device_tanaman       ON device(tanaman_id);
