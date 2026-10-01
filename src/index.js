@@ -25,12 +25,23 @@ if (!fs.existsSync(uploadsDir)) {
 }
 
 // ── Middleware ────────────────────────────────────────────
+const allowedOrigins = [
+  'http://localhost:5173',  // Vite dev server
+  'http://localhost:3000',
+  'http://127.0.0.1:5173',
+  ...(process.env.FRONTEND_URL ? process.env.FRONTEND_URL.split(',').map(u => u.trim()) : []),
+];
+
 app.use(cors({
-  origin: [
-    'http://localhost:5173',  // Vite dev server
-    'http://localhost:3000',
-    'http://127.0.0.1:5173',
-  ],
+  origin: (origin, callback) => {
+    // Izinkan request tanpa origin (seperti curl, mobile app, postman)
+    if (!origin) return callback(null, true);
+    // Jika origin terdaftar, atau ada wildcard, atau FRONTEND_URL tidak diset (fleksibel)
+    if (allowedOrigins.includes(origin) || allowedOrigins.includes('*') || !process.env.FRONTEND_URL) {
+      return callback(null, true);
+    }
+    return callback(new Error('CORS blocked: Origin tidak diizinkan'));
+  },
   credentials: true,
 }));
 app.use(express.json());
