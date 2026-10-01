@@ -1,5 +1,6 @@
 const { supabase } = require('../db');
 const { computePlantStatus, computeLastUpdateMinutes } = require('../services/statusService');
+const { computePlantCondition } = require('../services/plantConditionService');
 
 async function formatPlantSummary(plant) {
   // Fetch device
@@ -55,7 +56,7 @@ async function formatPlantSummary(plant) {
   let latestAnalysis = null;
   const { data: analysisData } = await supabase
     .from('disease_analyses')
-    .select('id, status, hasil_analisis, analyzed_at')
+    .select('id, status, hasil_analisis, health_score, disease_category, saran, analyzed_at')
     .eq('tanaman_id', plant.id)
     .order('analyzed_at', { ascending: false })
     .limit(1)
@@ -66,12 +67,30 @@ async function formatPlantSummary(plant) {
       id: analysisData.id,
       status: analysisData.status,
       result: analysisData.hasil_analisis,
+      health_score: analysisData.health_score,
+      disease_category: analysisData.disease_category,
+      saran: analysisData.saran,
       analyzedAt: analysisData.analyzed_at,
     };
   }
 
   const computedStatus = computePlantStatus(latestMoisture, plant.threshold_min, lastSeenAt);
   const lastUpdate = computeLastUpdateMinutes(lastSeenAt);
+
+  // Compute canonical plant condition
+  const conditionObj = computePlantCondition({
+    deviceId: device?.device_code || null,
+    hasDevice: Boolean(device),
+    lastSeenAt,
+    lastUpdate,
+    moisture: latestMoisture,
+    moistureMin: Number(plant.threshold_min),
+    moistureMax: Number(plant.threshold_max),
+    threshold_min: Number(plant.threshold_min),
+    threshold_max: Number(plant.threshold_max),
+    latestHealthScore: latestAnalysis?.health_score ?? null,
+    latestAnalysis,
+  });
 
   return {
     id: plant.id,
@@ -89,19 +108,33 @@ async function formatPlantSummary(plant) {
     hasDevice: Boolean(device),
     latestPhoto,
     latestAnalysis,
+    // Rich Agronomic Metadata
+    varietas: plant.varietas || null,
+    fasePertumbuhan: plant.fase_pertumbuhan || null,
+    mediaTanam: plant.media_tanam || null,
+    lokasiBlok: plant.lokasi_blok || null,
+    catatan: plant.catatan || null,
+    // Canonical condition fields from plantConditionService
+    condition: conditionObj.condition,
+    conditionLabel: conditionObj.conditionLabel,
+    conditionSeverity: conditionObj.conditionSeverity,
+    conditionColor: conditionObj.conditionColor,
+    sensorNotConnected: conditionObj.sensorNotConnected,
+    healthScore: conditionObj.healthScore,
+    countsInAverage: conditionObj.countsInAverage,
   };
 }
 
 /**
  * Resolusi target user_id berdasarkan role:
  *  - role 'user'          → selalu pakai id mereka sendiri
- *  - role 'worker'/'admin' → ambil dari query param ?userId, wajib ada
+ *  - role 'worker'/'admin' → ambil dari query param (?userId / ?targetUserId) atau body (userId / targetUserId)
  */
 function resolveTargetUserId(req, res) {
   if (req.user.role === 'user') {
     return { targetId: req.user.id, ok: true };
   }
-  const { userId } = req.query;
+  const userId = req.query?.userId || req.query?.targetUserId || req.body?.userId || req.body?.targetUserId;
   if (!userId) {
     res.status(400).json({ error: 'Parameter userId wajib disertakan untuk role worker/admin.' });
     return { ok: false };
@@ -133,15 +166,11 @@ async function getPlants(req, res, next) {
 async function getPlantDetail(req, res, next) {
   try {
     const { id } = req.params;
-    const { targetId, ok } = resolveTargetUserId(req, res);
-    if (!ok) return;
-
-    const { data: plant, error } = await supabase
-      .from('tanaman')
-      .select('*')
-      .eq('id', id)
-      .eq('user_id', targetId)
-      .maybeSingle();
+    let query = supabase.from('tanaman').select('*').eq('id', id);
+    if (req.user.role === 'user') {
+      query = query.eq('user_id', req.user.id);
+    }
+    const { data: plant, error } = await query.maybeSingle();
 
     if (error || !plant) {
       return res.status(404).json({ error: 'Tanaman tidak ditemukan' });
@@ -196,9 +225,10 @@ async function getPlantDetail(req, res, next) {
     }
 
     // Fetch water logs (last 6)
+    // Fetch water logs (last 6)
     const { data: waterLogs } = await supabase
       .from('irrigation_logs')
-      .select('id, trigger_type, waktu_mulai, kelembaban_awal, kelembaban_akhir, durasi_detik, dipicu_oleh_user_id, users(nama)')
+      .select('id, trigger_type, waktu_mulai, kelembaban_awal, kelembaban_akhir, durasi_detik, dipicu_oleh_user_id')
       .eq('tanaman_id', plant.id)
       .order('waktu_mulai', { ascending: false })
       .limit(6);
@@ -210,7 +240,7 @@ async function getPlantDetail(req, res, next) {
       before: log.kelembaban_awal !== null ? Number(log.kelembaban_awal) : null,
       after: log.kelembaban_akhir !== null ? Number(log.kelembaban_akhir) : null,
       duration: log.durasi_detik !== null ? Math.round(log.durasi_detik / 60) : null,
-      by: log.users?.nama || (log.trigger_type === 'manual' ? req.user.nama : undefined),
+      by: log.trigger_type === 'manual' ? (req.user.nama || req.user.name || 'User') : undefined,
     }));
 
     res.json({
@@ -231,7 +261,19 @@ async function createPlant(req, res, next) {
     const { targetId, ok } = resolveTargetUserId(req, res);
     if (!ok) return;
 
-    const { name, type, emoji, deviceId, moistureMin, moistureMax } = req.body;
+    const {
+      name,
+      type,
+      emoji,
+      deviceId,
+      moistureMin,
+      moistureMax,
+      varietas,
+      fasePertumbuhan,
+      mediaTanam,
+      lokasiBlok,
+      catatan,
+    } = req.body;
 
     if (!name || !type) {
       return res.status(400).json({ error: 'Nama dan jenis tanaman wajib diisi' });
@@ -244,6 +286,11 @@ async function createPlant(req, res, next) {
           user_id: targetId,
           nama: name.trim(),
           jenis_tanaman: type.trim(),
+          varietas: varietas ? varietas.trim() : null,
+          fase_pertumbuhan: fasePertumbuhan ? fasePertumbuhan.trim() : null,
+          media_tanam: mediaTanam ? mediaTanam.trim() : null,
+          lokasi_blok: lokasiBlok ? lokasiBlok.trim() : null,
+          catatan: catatan ? catatan.trim() : null,
           emoji: emoji || '🌱',
           threshold_min: moistureMin ?? 50,
           threshold_max: moistureMax ?? 80,
@@ -284,22 +331,46 @@ async function createPlant(req, res, next) {
 async function updatePlant(req, res, next) {
   try {
     const { id } = req.params;
-    const { targetId, ok } = resolveTargetUserId(req, res);
-    if (!ok) return;
+    const {
+      name,
+      type,
+      emoji,
+      deviceId,
+      moistureMin,
+      moistureMax,
+      varietas,
+      fasePertumbuhan,
+      mediaTanam,
+      lokasiBlok,
+      catatan,
+    } = req.body;
 
-    const { name, type, emoji, deviceId, moistureMin, moistureMax } = req.body;
+    let checkQuery = supabase.from('tanaman').select('id, user_id').eq('id', id);
+    if (req.user.role === 'user') {
+      checkQuery = checkQuery.eq('user_id', req.user.id);
+    }
+    const { data: existing, error: checkErr } = await checkQuery.maybeSingle();
+    if (checkErr || !existing) {
+      return res.status(404).json({ error: 'Tanaman tidak ditemukan atau tidak memiliki akses' });
+    }
+
+    const updatePayload = {
+      emoji: emoji || '🌱',
+      threshold_min: moistureMin,
+      threshold_max: moistureMax,
+    };
+    if (name !== undefined) updatePayload.nama = name.trim();
+    if (type !== undefined) updatePayload.jenis_tanaman = type.trim();
+    if (varietas !== undefined) updatePayload.varietas = varietas ? varietas.trim() : null;
+    if (fasePertumbuhan !== undefined) updatePayload.fase_pertumbuhan = fasePertumbuhan ? fasePertumbuhan.trim() : null;
+    if (mediaTanam !== undefined) updatePayload.media_tanam = mediaTanam ? mediaTanam.trim() : null;
+    if (lokasiBlok !== undefined) updatePayload.lokasi_blok = lokasiBlok ? lokasiBlok.trim() : null;
+    if (catatan !== undefined) updatePayload.catatan = catatan ? catatan.trim() : null;
 
     const { data: updatedPlant, error } = await supabase
       .from('tanaman')
-      .update({
-        nama: name?.trim(),
-        jenis_tanaman: type?.trim(),
-        emoji: emoji || '🌱',
-        threshold_min: moistureMin,
-        threshold_max: moistureMax,
-      })
+      .update(updatePayload)
       .eq('id', id)
-      .eq('user_id', targetId)
       .select()
       .single();
 
@@ -307,11 +378,34 @@ async function updatePlant(req, res, next) {
       return res.status(404).json({ error: 'Tanaman tidak ditemukan atau gagal diperbarui' });
     }
 
-    if (deviceId && deviceId.trim()) {
-      await supabase
-        .from('device')
-        .update({ device_code: deviceId.trim() })
-        .eq('tanaman_id', id);
+    if (deviceId !== undefined) {
+      if (deviceId && deviceId.trim()) {
+        const { data: existingDevice } = await supabase
+          .from('device')
+          .select('id')
+          .eq('tanaman_id', id)
+          .maybeSingle();
+
+        if (existingDevice) {
+          await supabase
+            .from('device')
+            .update({ device_code: deviceId.trim() })
+            .eq('id', existingDevice.id);
+        } else {
+          await supabase
+            .from('device')
+            .insert([
+              {
+                tanaman_id: id,
+                device_code: deviceId.trim(),
+                tipe_device: 'ESP32',
+                status_koneksi: 'perlu_dicek',
+              },
+            ]);
+        }
+      } else {
+        await supabase.from('device').delete().eq('tanaman_id', id);
+      }
     }
 
     const result = await formatPlantSummary(updatedPlant);
@@ -324,16 +418,42 @@ async function updatePlant(req, res, next) {
 async function deletePlant(req, res, next) {
   try {
     const { id } = req.params;
-    const { targetId, ok } = resolveTargetUserId(req, res);
-    if (!ok) return;
 
-    const { error } = await supabase
+    let checkQuery = supabase.from('tanaman').select('id, user_id').eq('id', id);
+    if (req.user.role === 'user') {
+      checkQuery = checkQuery.eq('user_id', req.user.id);
+    }
+    const { data: existing, error: checkErr } = await checkQuery.maybeSingle();
+    if (checkErr || !existing) {
+      return res.status(404).json({ error: 'Tanaman tidak ditemukan atau tidak memiliki akses' });
+    }
+
+    // Bersihkan semua relasi anak secara eksplisit agar tidak ada ghost records atau foreign key block
+    try {
+      await supabase.from('disease_analyses').delete().eq('tanaman_id', id);
+      await supabase.from('plant_photos').delete().eq('tanaman_id', id);
+      await supabase.from('irrigation_logs').delete().eq('tanaman_id', id);
+
+      const { data: devices } = await supabase.from('device').select('id').eq('tanaman_id', id);
+      if (devices && devices.length > 0) {
+        const deviceIds = devices.map((d) => d.id);
+        await supabase.from('device_commands').delete().in('device_id', deviceIds);
+        await supabase.from('sensor_readings').delete().in('device_id', deviceIds);
+        await supabase.from('device').delete().eq('tanaman_id', id);
+      }
+
+      await supabase.from('chat_messages').update({ tanaman_id: null }).eq('tanaman_id', id);
+    } catch (cleanupErr) {
+      console.warn('[deletePlant] Cleanup child records info:', cleanupErr.message);
+    }
+
+    // Hard delete baris tanaman dari database
+    const { error: delError } = await supabase
       .from('tanaman')
       .delete()
-      .eq('id', id)
-      .eq('user_id', targetId);
+      .eq('id', id);
 
-    if (error) throw error;
+    if (delError) throw delError;
 
     res.json({ message: 'Tanaman berhasil dihapus' });
   } catch (err) {
@@ -344,15 +464,12 @@ async function deletePlant(req, res, next) {
 async function triggerWatering(req, res, next) {
   try {
     const { id } = req.params;
-    const { targetId, ok } = resolveTargetUserId(req, res);
-    if (!ok) return;
 
-    const { data: plant, error: plantError } = await supabase
-      .from('tanaman')
-      .select('id, threshold_max')
-      .eq('id', id)
-      .eq('user_id', targetId)
-      .maybeSingle();
+    let query = supabase.from('tanaman').select('id, threshold_max, user_id').eq('id', id);
+    if (req.user.role === 'user') {
+      query = query.eq('user_id', req.user.id);
+    }
+    const { data: plant, error: plantError } = await query.maybeSingle();
 
     if (plantError || !plant) {
       return res.status(404).json({ error: 'Tanaman tidak ditemukan' });
@@ -421,27 +538,33 @@ async function triggerWatering(req, res, next) {
 async function toggleAutoWater(req, res, next) {
   try {
     const { id } = req.params;
-    const { targetId, ok } = resolveTargetUserId(req, res);
-    if (!ok) return;
-
     const { enabled } = req.body;
 
-    const { data: plant, error } = await supabase
+    let checkQuery = supabase.from('tanaman').select('id, user_id').eq('id', id);
+    if (req.user.role === 'user') {
+      checkQuery = checkQuery.eq('user_id', req.user.id);
+    }
+    const { data: plant, error: checkError } = await checkQuery.maybeSingle();
+
+    if (checkError || !plant) {
+      return res.status(404).json({ error: 'Tanaman tidak ditemukan' });
+    }
+
+    const { data: updated, error } = await supabase
       .from('tanaman')
       .update({ auto_water_mode: Boolean(enabled) })
       .eq('id', id)
-      .eq('user_id', targetId)
       .select()
       .single();
 
-    if (error || !plant) {
+    if (error || !updated) {
       return res.status(404).json({ error: 'Tanaman tidak ditemukan' });
     }
 
     res.json({
-      id: plant.id,
-      autoWater: Boolean(plant.auto_water_mode),
-      message: plant.auto_water_mode ? 'Siram otomatis diaktifkan' : 'Siram otomatis dinonaktifkan',
+      id: updated.id,
+      autoWater: Boolean(updated.auto_water_mode),
+      message: updated.auto_water_mode ? 'Siram otomatis diaktifkan' : 'Siram otomatis dinonaktifkan',
     });
   } catch (err) {
     next(err);
@@ -452,16 +575,12 @@ async function getPlantChartHistory(req, res, next) {
   try {
     const { id } = req.params;
     const { range = 'daily' } = req.query;
-    const { targetId, ok } = resolveTargetUserId(req, res);
-    if (!ok) return;
 
-    // Verifikasi kepemilikan tanaman
-    const { data: plant } = await supabase
-      .from('tanaman')
-      .select('id')
-      .eq('id', id)
-      .eq('user_id', targetId)
-      .maybeSingle();
+    let query = supabase.from('tanaman').select('id, user_id').eq('id', id);
+    if (req.user.role === 'user') {
+      query = query.eq('user_id', req.user.id);
+    }
+    const { data: plant } = await query.maybeSingle();
 
     if (!plant) {
       return res.status(404).json({ error: 'Tanaman tidak ditemukan' });

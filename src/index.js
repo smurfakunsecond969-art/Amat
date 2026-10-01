@@ -45,10 +45,12 @@ app.get('/api/health', (_req, res) => {
 app.use('/api/auth',    authRoutes);
 app.use('/api/plants',  plantsRoutes);
 app.use('/api/plants',  aiRoutes);      // foto analisis: /api/plants/:id/photos/*
+app.use('/api/history', historyRoutes); // riwayat penyiraman & foto: /api/history, /api/history/photos
+app.use('/api/device',  deviceRoutes);  // device telemetry: /api/device/*
 app.use('/api/profile', profileRoutes);
 app.use('/api/admin',   adminRoutes);
 app.use('/api/users',   usersRoutes);
-app.use('/api/ai',      aiRoutes);      // chat Taku: /api/ai/chat
+app.use('/api/ai',      aiRoutes);      // chat Taku & analytics: /api/ai/*
 
 
 // ── 404 catch ─────────────────────────────────────────────

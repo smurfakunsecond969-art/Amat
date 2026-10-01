@@ -32,7 +32,7 @@ function computePlantStatus(moisture, thresholdMin, lastSeenAt) {
   * Hitung menit sejak lastSeenAt
   */
 function computeLastUpdateMinutes(lastSeenAt) {
-  if (!lastSeenAt) return 999;
+  if (!lastSeenAt) return null;
   const now = new Date();
   const lastSeen = new Date(lastSeenAt);
   const diffMinutes = Math.floor((now.getTime() - lastSeen.getTime()) / (1000 * 60));

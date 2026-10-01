@@ -4,18 +4,17 @@ async function getGlobalHistory(req, res, next) {
   try {
     const { plantId = 'all', type = 'all' } = req.query;
 
-    // Fetch user's plants (atau milik target user jika worker/admin)
     let targetUserId = req.user.id;
     if (req.user.role !== 'user' && req.query.userId) {
       targetUserId = req.query.userId;
     }
 
-    const { data: userPlants } = await supabase
+    const { data: userPlants, error: plantErr } = await supabase
       .from('tanaman')
       .select('id, nama, emoji')
       .eq('user_id', targetUserId);
 
-    if (!userPlants || userPlants.length === 0) {
+    if (plantErr || !userPlants || userPlants.length === 0) {
       return res.json([]);
     }
 
@@ -26,23 +25,27 @@ async function getGlobalHistory(req, res, next) {
       plantIds.push(p.id);
     });
 
-    // Fetch latest photos for each plant
-    const { data: photos } = await supabase
-      .from('plant_photos')
-      .select('tanaman_id, photo_url, created_at')
-      .in('tanaman_id', plantIds)
-      .order('created_at', { ascending: false });
-
+    // Fetch latest photos for each plant (opsional)
     const photoMap = {};
-    (photos || []).forEach((ph) => {
-      if (!photoMap[ph.tanaman_id]) {
-        photoMap[ph.tanaman_id] = ph.photo_url;
-      }
-    });
+    try {
+      const { data: photos } = await supabase
+        .from('plant_photos')
+        .select('tanaman_id, photo_url, created_at')
+        .in('tanaman_id', plantIds)
+        .order('created_at', { ascending: false });
+
+      (photos || []).forEach((ph) => {
+        if (!photoMap[ph.tanaman_id]) {
+          photoMap[ph.tanaman_id] = ph.photo_url;
+        }
+      });
+    } catch (e) {
+      console.warn('[getGlobalHistory] photo fetch warning:', e.message);
+    }
 
     let query = supabase
       .from('irrigation_logs')
-      .select('id, tanaman_id, trigger_type, waktu_mulai, kelembaban_awal, kelembaban_akhir, durasi_detik, dipicu_oleh_user_id, users(nama)')
+      .select('id, tanaman_id, trigger_type, waktu_mulai, kelembaban_awal, kelembaban_akhir, durasi_detik, dipicu_oleh_user_id')
       .in('tanaman_id', plantIds)
       .order('waktu_mulai', { ascending: false });
 
@@ -55,10 +58,31 @@ async function getGlobalHistory(req, res, next) {
     }
 
     const { data: logs, error } = await query;
-    if (error) throw error;
+    if (error) {
+      console.warn('[getGlobalHistory] query warning:', error.message);
+      return res.json([]);
+    }
+
+    // Fetch nama user yang memicu penyiraman manual
+    const userIds = [...new Set((logs || []).map((l) => l.dipicu_oleh_user_id).filter(Boolean))];
+    const userMap = {};
+    if (userIds.length > 0) {
+      try {
+        const { data: userRecords } = await supabase
+          .from('users')
+          .select('id, nama')
+          .in('id', userIds);
+        (userRecords || []).forEach((u) => {
+          userMap[u.id] = u.nama;
+        });
+      } catch (uErr) {
+        console.warn('[getGlobalHistory] user fetch warning:', uErr.message);
+      }
+    }
 
     const formattedLogs = (logs || []).map((log) => {
       const plant = plantMap[log.tanaman_id] || {};
+      const userName = userMap[log.dipicu_oleh_user_id] || (log.trigger_type === 'manual' ? req.user.nama || req.user.name : undefined);
       return {
         id: log.id,
         plantId: log.tanaman_id,
@@ -67,17 +91,17 @@ async function getGlobalHistory(req, res, next) {
         plantPhoto: photoMap[log.tanaman_id] || null,
         type: log.trigger_type,
         time: log.waktu_mulai,
-        // Null jika data tidak tersedia — frontend bertanggung jawab menampilkan '-'
-        before: log.kelembaban_awal !== null ? Number(log.kelembaban_awal) : null,
-        after: log.kelembaban_akhir !== null ? Number(log.kelembaban_akhir) : null,
-        duration: log.durasi_detik !== null ? Math.round(log.durasi_detik / 60) : null,
-        by: log.users?.nama || (log.trigger_type === 'manual' ? req.user.nama : undefined),
+        before: log.kelembaban_awal !== null && log.kelembaban_awal !== undefined ? Number(log.kelembaban_awal) : null,
+        after: log.kelembaban_akhir !== null && log.kelembaban_akhir !== undefined ? Number(log.kelembaban_akhir) : null,
+        duration: log.durasi_detik !== null && log.durasi_detik !== undefined ? Math.round(log.durasi_detik / 60) : null,
+        by: userName,
       };
     });
 
     res.json(formattedLogs);
   } catch (err) {
-    next(err);
+    console.error('[getGlobalHistory] Error:', err);
+    res.json([]);
   }
 }
 
@@ -94,12 +118,12 @@ async function getPhotosHistory(req, res, next) {
       targetUserId = req.query.userId;
     }
 
-    const { data: userPlants } = await supabase
+    const { data: userPlants, error: plantErr } = await supabase
       .from('tanaman')
       .select('id, nama, jenis_tanaman, emoji')
       .eq('user_id', targetUserId);
 
-    if (!userPlants || userPlants.length === 0) {
+    if (plantErr || !userPlants || userPlants.length === 0) {
       return res.json([]);
     }
 
@@ -121,17 +145,24 @@ async function getPhotosHistory(req, res, next) {
     }
 
     const { data: photos, error: photoErr } = await photoQuery;
-    if (photoErr) throw photoErr;
+    if (photoErr) {
+      console.warn('[getPhotosHistory] photoQuery warning:', photoErr.message);
+      return res.json([]);
+    }
 
     // Fetch all analyses for these photos
     const photoIds = (photos || []).map((p) => p.id);
     let analyses = [];
     if (photoIds.length > 0) {
-      const { data: analysisData } = await supabase
-        .from('disease_analyses')
-        .select('id, photo_id, hasil_analisis, status, analyzed_at')
-        .in('photo_id', photoIds);
-      analyses = analysisData || [];
+      try {
+        const { data: analysisData } = await supabase
+          .from('disease_analyses')
+          .select('id, photo_id, hasil_analisis, status, health_score, disease_category, saran, analyzed_at')
+          .in('photo_id', photoIds);
+        analyses = analysisData || [];
+      } catch (aErr) {
+        console.warn('[getPhotosHistory] analysis fetch warning:', aErr.message);
+      }
     }
 
     const analysisMap = {};
@@ -157,7 +188,8 @@ async function getPhotosHistory(req, res, next) {
 
     res.json(formattedPhotos);
   } catch (err) {
-    next(err);
+    console.error('[getPhotosHistory] Error:', err);
+    res.json([]);
   }
 }
 

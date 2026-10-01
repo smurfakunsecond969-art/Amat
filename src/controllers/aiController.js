@@ -117,32 +117,64 @@ async function callAI(messages) {
 }
 
 /**
- * Tentukan status kesehatan dari teks hasil analisis AI
- * Return: 'sehat' | 'perlu_perhatian' | 'terindikasi_penyakit'
+/**
+ * Validasi status dari JSON AI — fallback ke 'sehat' kalau tidak valid
  */
-function inferStatus(text) {
-  const lower = (text || '').toLowerCase();
-  if (
-    lower.includes('penyakit') ||
-    lower.includes('infeksi') ||
-    lower.includes('jamur') ||
-    lower.includes('bercak') ||
-    lower.includes('busuk') ||
-    lower.includes('hama') ||
-    lower.includes('kutu') ||
-    lower.includes('ulat')
-  ) return 'terindikasi_penyakit';
-  if (
-    lower.includes('perhatian') ||
-    lower.includes('waspada') ||
-    lower.includes('kurang') ||
-    lower.includes('pucat') ||
-    lower.includes('layu') ||
-    lower.includes('menguning') ||
-    lower.includes('kekurangan')
-  ) return 'perlu_perhatian';
-  return 'sehat';
+function validateStatus(status) {
+  const valid = ['sehat', 'perlu_perhatian', 'terindikasi_penyakit'];
+  return valid.includes(status) ? status : 'sehat';
 }
+
+/**
+ * Daftar kategori penyakit valid
+ */
+const DISEASE_CATEGORIES = [
+  'Kekurangan Air',
+  'Kelebihan Air / Akar Busuk',
+  'Serangan Jamur',
+  'Serangan Hama/Serangga',
+  'Kekurangan Nutrisi',
+  'Penyakit Daun Lainnya',
+  'Tidak Teridentifikasi',
+];
+
+/**
+ * Parse JSON response dari AI Vision — defensif terhadap teks non-JSON atau parsial
+ * Return: { healthScore, status, disease_category, diagnosis, saran }
+ */
+function parseAIAnalysis(rawText) {
+  try {
+    // Coba ekstrak JSON dari teks (kadang AI balas dengan markdown code block)
+    const jsonMatch = rawText.match(/\{[\s\S]*\}/);
+    if (jsonMatch) {
+      const parsed = JSON.parse(jsonMatch[0]);
+      const healthScore = Number(parsed.healthScore);
+      return {
+        healthScore: (healthScore >= 1 && healthScore <= 100) ? healthScore : 65,
+        status: validateStatus(parsed.status),
+        disease_category: DISEASE_CATEGORIES.includes(parsed.disease_category)
+          ? parsed.disease_category
+          : 'Tidak Teridentifikasi',
+        diagnosis: parsed.diagnosis || '',
+        saran: parsed.saran || '',
+        // Buat hasil_analisis teks gabungan untuk kompatibilitas field lama
+        hasil: `${parsed.diagnosis || ''}\n\n💡 Saran: ${parsed.saran || ''}`.trim(),
+      };
+    }
+  } catch (e) {
+    // JSON parse gagal — fallback ke teks lama
+  }
+  // Fallback: teks bebas (backward compat)
+  return {
+    healthScore: 65,
+    status: 'sehat',
+    disease_category: 'Tidak Teridentifikasi',
+    diagnosis: rawText,
+    saran: '',
+    hasil: rawText,
+  };
+}
+
 
 // ── Controllers ───────────────────────────────────────────────
 
@@ -162,7 +194,7 @@ async function analyzePhoto(req, res, next) {
     // Verifikasi tanaman milik user (atau user adalah worker/admin)
     const { data: plant, error: plantErr } = await supabase
       .from('tanaman')
-      .select('id, nama, jenis_tanaman, user_id')
+      .select('id, nama, jenis_tanaman, varietas, fase_pertumbuhan, media_tanam, lokasi_blok, catatan, threshold_min, threshold_max, user_id')
       .eq('id', plantId)
       .maybeSingle();
 
@@ -176,6 +208,27 @@ async function analyzePhoto(req, res, next) {
 
     if (!isOwnerOrStaff) {
       return res.status(403).json({ error: 'Tidak punya akses ke tanaman ini.' });
+    }
+
+    // Ambil data sensor terkini jika ada
+    let sensorMoistureInfo = 'Sensor belum terhubung';
+    const { data: device } = await supabase
+      .from('device')
+      .select('id')
+      .eq('tanaman_id', plantId)
+      .maybeSingle();
+
+    if (device) {
+      const { data: latestReading } = await supabase
+        .from('sensor_readings')
+        .select('kelembaban_tanah')
+        .eq('device_id', device.id)
+        .order('recorded_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+      if (latestReading && latestReading.kelembaban_tanah !== null) {
+        sensorMoistureInfo = `${latestReading.kelembaban_tanah}% (Ambang batas ideal: ${plant.threshold_min || 50}%-${plant.threshold_max || 80}%)`;
+      }
     }
 
     // 1. Simpan file foto (Supabase Storage / Local disk fallback)
@@ -202,12 +255,38 @@ async function analyzePhoto(req, res, next) {
     const mimeType = req.file.mimetype || 'image/jpeg';
     const base64DataUrl = `data:${mimeType};base64,${req.file.buffer.toString('base64')}`;
 
+    const plantContextDetails = [
+      `Nama Tanaman: ${plant.nama}`,
+      `Jenis Komoditas: ${plant.jenis_tanaman || 'Umum'}`,
+      plant.varietas ? `Varietas/Kultivar: ${plant.varietas}` : null,
+      plant.fase_pertumbuhan ? `Fase Pertumbuhan: ${plant.fase_pertumbuhan}` : null,
+      plant.media_tanam ? `Media Tanam/Tipe Tanah: ${plant.media_tanam}` : null,
+      plant.lokasi_blok ? `Lokasi Kebun/Blok: ${plant.lokasi_blok}` : null,
+      plant.catatan ? `Catatan/Riwayat Perlakuan: ${plant.catatan}` : null,
+      `Kelembaban Sensor Tanah Saat Ini: ${sensorMoistureInfo}`,
+    ].filter(Boolean).join('\n- ');
+
     const aiMessages = [{
       role: 'user',
       content: [
         {
           type: 'text',
-          text: `Analisa foto daun/tanaman ini (Tanaman: ${plant.nama}, Jenis: ${plant.jenis_tanaman || 'Umum'}). Sebutkan kondisi kesehatannya secara ringkas, indikasi penyakit atau hama jika ada, dan rekomendasi perawatan praktis. Jawab dalam Bahasa Indonesia yang ramah, jelas, dan terstruktur untuk petani.`,
+          text: `Kamu adalah Agronomist & Pakar Patologi Tanaman AI. Analisa foto daun/tanaman ini secara komprehensif dan akurat berdasarkan data agronomis berikut:
+- ${plantContextDetails}
+
+Instruksi Analisis:
+1. Sesuaikan diagnosa penyakit dengan varietas dan fase pertumbuhan spesifik di atas (misal: gejala pada fase vegetatif vs pembuahan, atau kerentanan khusus varietas).
+2. Perhitungkan juga data kelembaban tanah sensor dan media tanam untuk memastikan apakah masalah berasal dari air/akar atau patogen/hama.
+3. Berikan saran penanganan dan dosis/tindakan praktis yang realistis dan tepat sasaran.
+
+Balas HANYA dengan format JSON valid berikut (tanpa markdown backticks atau teks tambahan lainnya):
+{
+  "healthScore": <angka 1-100, 100 = paling sehat dan bebas penyakit>,
+  "status": "sehat" atau "perlu_perhatian" atau "terindikasi_penyakit",
+  "disease_category": salah satu dari: "Kekurangan Air", "Kelebihan Air / Akar Busuk", "Serangan Jamur", "Serangan Hama/Serangga", "Kekurangan Nutrisi", "Penyakit Daun Lainnya", "Tidak Teridentifikasi",
+  "diagnosis": "<penjelasan diagnosa klinis daun/tanaman max 2 kalimat dalam Bahasa Indonesia>",
+  "saran": "<saran penanganan terarah dan solusi agronomis praktis max 2 kalimat dalam Bahasa Indonesia>"
+}`,
         },
         {
           type: 'image_url',
@@ -216,26 +295,33 @@ async function analyzePhoto(req, res, next) {
       ],
     }];
 
-    let hasilAnalisis = '';
-    let status = 'sehat';
+    let analysisResult = {
+      healthScore: 65,
+      status: 'sehat',
+      disease_category: 'Tidak Teridentifikasi',
+      diagnosis: '',
+      saran: '',
+      hasil: `Tanaman ${plant.nama} telah difoto dan didokumentasikan. Kondisi visual umum tercatat. Rekomendasi: jaga kelembaban tanah dan pantau perkembangan daun secara berkala.`,
+    };
 
     try {
-      hasilAnalisis = await callAI(aiMessages);
-      status = inferStatus(hasilAnalisis);
+      const rawReply = await callAI(aiMessages);
+      analysisResult = parseAIAnalysis(rawReply);
     } catch (aiErr) {
       console.error('AI Vision call error:', aiErr);
-      hasilAnalisis = `Tanaman ${plant.nama} telah difoto dan didokumentasikan. Kondisi visual umum tercatat. Rekomendasi: jaga kelembaban tanah dan pantau perkembangan daun secara berkala.`;
-      status = 'sehat';
     }
 
-    // 4. Simpan hasil analisis ke database
+    // 4. Simpan hasil analisis ke database (dengan kolom baru health_score, disease_category, saran)
     const { data: analysisRecord, error: analysisErr } = await supabase
       .from('disease_analyses')
       .insert({
-        tanaman_id:     plantId,
-        photo_id:       photoRecord.id,
-        hasil_analisis: hasilAnalisis,
-        status,
+        tanaman_id:       plantId,
+        photo_id:         photoRecord.id,
+        hasil_analisis:   analysisResult.hasil,
+        status:           analysisResult.status,
+        health_score:     analysisResult.healthScore,
+        disease_category: analysisResult.disease_category,
+        saran:            analysisResult.saran,
       })
       .select()
       .single();
@@ -245,11 +331,14 @@ async function analyzePhoto(req, res, next) {
     }
 
     return res.json({
-      success:  true,
-      photo:    photoRecord,
-      analysis: analysisRecord || null,
-      hasil:    hasilAnalisis,
-      status,
+      success:         true,
+      photo:           photoRecord,
+      analysis:        analysisRecord || null,
+      hasil:           analysisResult.hasil,
+      status:          analysisResult.status,
+      healthScore:     analysisResult.healthScore,
+      diseaseCategory: analysisResult.disease_category,
+      saran:           analysisResult.saran,
     });
   } catch (err) {
     console.error('analyzePhoto error:', err);
@@ -561,7 +650,7 @@ async function takuCommand(req, res, next) {
       return res.status(400).json({ error: 'Pesan tidak boleh kosong.' });
     }
 
-    // ── 1. Ambil tanaman user ─────────────────────────────────────
+    // ── 1. Ambil tanaman user (paralel) ──────────────────────────
     const { data: tanamanRaw, error: tanamanErr } = await supabase
       .from('tanaman')
       .select('id, nama, jenis_tanaman, status, threshold_min, threshold_max, auto_water_mode')
@@ -571,9 +660,8 @@ async function takuCommand(req, res, next) {
       console.error('[takuCommand] Gagal ambil tanaman:', tanamanErr);
     }
 
-    // Ambil moisture terbaru per tanaman via device + sensor_readings
-    const plants = [];
-    for (const t of (tanamanRaw || [])) {
+    // Ambil moisture terbaru per tanaman via device + sensor_readings (Promise.all paralel)
+    const plants = await Promise.all((tanamanRaw || []).map(async (t) => {
       const { data: device } = await supabase
         .from('device')
         .select('id')
@@ -589,25 +677,156 @@ async function takuCommand(req, res, next) {
           .order('recorded_at', { ascending: false })
           .limit(1)
           .maybeSingle();
-        if (reading) moisture = reading.kelembaban_tanah;
+        if (reading) moisture = Number(reading.kelembaban_tanah);
       }
 
-      plants.push({
+      return {
         id: t.id,
         name: t.nama,
         type: t.jenis_tanaman,
         status: t.status,
         moisture,
-        moistureMin: t.threshold_min,
-        moistureMax: t.threshold_max,
-        autoWater: t.auto_water_mode,
-      });
-    }
+        moistureMin: Number(t.threshold_min) || 40,
+        moistureMax: Number(t.threshold_max) || 80,
+        autoWater: Boolean(t.auto_water_mode),
+      };
+    }));
 
     // ── 2. Hitung garden report ────────────────────────────────────
     const report = computeGardenReport(plants);
 
-    // ── 3. Siapkan system prompt + tools ──────────────────────────
+    // ── FAST-PATH: Instant intent matching untuk perintah populer (< 20ms) ──
+    const lowerMsg = message.toLowerCase().trim();
+
+    // A. Laporan Kebun
+    if (
+      lowerMsg.includes('laporan') ||
+      lowerMsg.includes('kondisi kebun') ||
+      lowerMsg.includes('status kebun') ||
+      lowerMsg.includes('kondisi tanaman') ||
+      lowerMsg.includes('status tanaman') ||
+      lowerMsg.includes('bagaimana kebun')
+    ) {
+      let repReply = '';
+      if (report.warningCount > 0 && report.driestPlant) {
+        repReply = `Oke, laporan kebunmu siap! Dari ${report.total} tanaman, skor kesehatan kebun ada di ${report.healthScore}. ${report.goodCount} tanaman kondisinya oke, tapi ${report.warningCount} butuh perhatian — terutama ${report.driestPlant.name}, kelembabannya udah di ${report.driestPlant.moisture} persen. Mau langsung gw siram sekarang?`;
+      } else {
+        repReply = `Laporan kebunmu keren banget hari ini! Semua ${report.total} tanaman dalam kondisi baik, skor kesehatan kebun ada di ${report.healthScore}. Gak ada yang butuh perhatian khusus sekarang 🌱`;
+      }
+      return res.json({
+        success: true,
+        toolCalls: [
+          { name: 'get_garden_report', parameters: {} },
+          { name: 'navigate_to_page', parameters: { page: 'kebun-saya' } },
+        ],
+        spokenReply: repReply,
+        plants,
+        report,
+      });
+    }
+
+    // B. Siram Tanaman
+    if (lowerMsg.includes('siram') || lowerMsg.includes('siramin') || lowerMsg.includes('watering')) {
+      let targetPlantName = 'semua';
+      if (!lowerMsg.includes('semua')) {
+        const found = plants.find((p) =>
+          lowerMsg.includes(p.name.toLowerCase()) ||
+          (p.type && lowerMsg.includes(p.type.toLowerCase())) ||
+          p.name.toLowerCase().split(' ').some((w) => w.length > 2 && lowerMsg.includes(w))
+        );
+        if (found) targetPlantName = found.name;
+      }
+
+      const spokenReply = targetPlantName === 'semua'
+        ? `Oke, ${plants.length} tanaman udah gw siram semua barusan!`
+        : `Sip, ${targetPlantName} udah gw siram sekarang!`;
+
+      return res.json({
+        success: true,
+        toolCalls: [{ name: 'water_plant', parameters: { target: targetPlantName } }],
+        spokenReply,
+        plants,
+        report,
+      });
+    }
+
+    // C. Navigasi Halaman
+    if (lowerMsg.includes('dashboard') || lowerMsg.includes('beranda')) {
+      return res.json({
+        success: true,
+        toolCalls: [{ name: 'navigate_to_page', parameters: { page: 'dashboard' } }],
+        spokenReply: 'Siap, membuka halaman Dashboard.',
+        plants,
+        report,
+      });
+    }
+    if (lowerMsg.includes('kebun') || lowerMsg.includes('tanaman saya')) {
+      return res.json({
+        success: true,
+        toolCalls: [{ name: 'navigate_to_page', parameters: { page: 'kebun-saya' } }],
+        spokenReply: 'Siap, membuka halaman Kebun Saya.',
+        plants,
+        report,
+      });
+    }
+    if (lowerMsg.includes('riwayat') || lowerMsg.includes('history')) {
+      return res.json({
+        success: true,
+        toolCalls: [{ name: 'navigate_to_page', parameters: { page: 'riwayat' } }],
+        spokenReply: 'Siap, membuka halaman Riwayat.',
+        plants,
+        report,
+      });
+    }
+    if (lowerMsg.includes('kelola') || lowerMsg.includes('manajemen tanaman')) {
+      return res.json({
+        success: true,
+        toolCalls: [{ name: 'navigate_to_page', parameters: { page: 'kelola-tanaman' } }],
+        spokenReply: 'Siap, membuka Manajemen Tanaman.',
+        plants,
+        report,
+      });
+    }
+    if (lowerMsg.includes('profil') || lowerMsg.includes('pengaturan')) {
+      return res.json({
+        success: true,
+        toolCalls: [{ name: 'navigate_to_page', parameters: { page: 'profil' } }],
+        spokenReply: 'Siap, membuka Profil dan Pengaturan.',
+        plants,
+        report,
+      });
+    }
+
+    // D. Ganti Tema Tampilan (Dark Mode / Light Mode)
+    if (lowerMsg.includes('dark mode') || lowerMsg.includes('mode gelap') || lowerMsg.includes('tema malam') || lowerMsg.includes('mode malam')) {
+      return res.json({
+        success: true,
+        toolCalls: [{ name: 'toggle_theme', parameters: { theme: 'dark' } }],
+        spokenReply: 'Siap, beralih ke Mode Gelap Kebun Malam.',
+        plants,
+        report,
+      });
+    }
+    if (lowerMsg.includes('light mode') || lowerMsg.includes('mode terang') || lowerMsg.includes('tema siang') || lowerMsg.includes('mode siang')) {
+      return res.json({
+        success: true,
+        toolCalls: [{ name: 'toggle_theme', parameters: { theme: 'light' } }],
+        spokenReply: 'Siap, beralih ke Mode Terang.',
+        plants,
+        report,
+      });
+    }
+    if (lowerMsg.includes('ganti tema') || lowerMsg.includes('ubah tema') || lowerMsg.includes('toggle mode')) {
+      return res.json({
+        success: true,
+        toolCalls: [{ name: 'toggle_theme', parameters: {} }],
+        spokenReply: 'Siap, tema tampilan sudah diganti.',
+        plants,
+        report,
+      });
+    }
+
+    // ── 3. Fallback ke Pateway AI untuk pertanyaan bebas / conversational ──
     const plantsContext = plants.length
       ? plants.map((p) =>
           `- ${p.name} (${p.type || 'Umum'}): kelembaban ${p.moisture !== null ? p.moisture + '%' : 'tidak ada data'}, ` +
@@ -616,114 +835,23 @@ async function takuCommand(req, res, next) {
         ).join('\n')
       : '(Belum ada tanaman terdaftar)';
 
-    const systemPrompt = `Kamu adalah Taku, asisten AI di aplikasi Tanamanku.
+    const systemPrompt = `Kamu adalah Taku, asisten AI ramah di aplikasi Tanamanku.
+Jawab singkat (maksimal 2-3 kalimat) dalam Bahasa Indonesia santai.
+Nama user: ${firstName}
+Kebun ${firstName}: ${plants.length} tanaman, skor ${report.healthScore}/100.
+${plantsContext}`;
 
-Kamu BUKAN chatbot biasa — kamu punya akses untuk menjalankan aksi nyata di aplikasi lewat tools.
-Kepribadianmu: santai, seru, gak formal, kayak asisten pribadi yang asik diajak ngobrol, TAPI tetap jelas dan informatif kalau lagi laporan data.
-
-Aturan:
-- Kalau user minta aksi (siram, pindah halaman, dll), PANGGIL tool yang sesuai, jangan cuma jawab teks.
-- Kalau user cuma nanya/ngobrol, pakai tool "answer_only".
-- Kalau diminta laporan kebun, panggil "get_garden_report" DAN "navigate_to_page" (ke "kebun-saya") sekaligus.
-- Selalu jawab dalam Bahasa Indonesia yang natural, bukan kaku/formal.
-- Nama user: ${firstName}
-- Halaman yang sedang dibuka user: ${currentPage || 'tidak diketahui'}
-
-Data kebun ${firstName}:
-${plantsContext}
-
-Ringkasan kebun:
-- Total tanaman: ${report.total}
-- Skor kesehatan: ${report.healthScore}/100
-- Rata-rata kelembaban: ${report.avgMoisture !== null ? report.avgMoisture + '%' : 'tidak ada data'}
-- Kondisi baik: ${report.goodCount} tanaman
-- Butuh perhatian: ${report.warningCount} tanaman
-- Tanaman paling kering: ${report.driestPlant ? report.driestPlant.name + ' (' + report.driestPlant.moisture + '%)' : 'tidak ada data'}`;
-
-    const tools = [
-      {
-        type: 'function',
-        function: {
-          name: 'navigate_to_page',
-          description: 'Pindah ke halaman tertentu di aplikasi',
-          parameters: {
-            type: 'object',
-            properties: {
-              page: {
-                type: 'string',
-                enum: ['dashboard', 'kebun-saya', 'riwayat', 'kelola-tanaman', 'profil', 'taku-chat'],
-                description: 'Nama halaman tujuan'
-              }
-            },
-            required: ['page']
-          }
-        }
-      },
-      {
-        type: 'function',
-        function: {
-          name: 'water_plant',
-          description: 'Menyiram satu tanaman spesifik atau semua tanaman sekaligus',
-          parameters: {
-            type: 'object',
-            properties: {
-              target: {
-                type: 'string',
-                description: 'Nama tanaman yang ingin disiram, atau "semua" untuk menyiram semua tanaman'
-              }
-            },
-            required: ['target']
-          }
-        }
-      },
-      {
-        type: 'function',
-        function: {
-          name: 'toggle_auto_water',
-          description: 'Aktifkan atau nonaktifkan mode siram otomatis untuk tanaman tertentu',
-          parameters: {
-            type: 'object',
-            properties: {
-              plantName: { type: 'string', description: 'Nama tanaman' },
-              enabled: { type: 'boolean', description: 'true untuk aktifkan, false untuk nonaktifkan' }
-            },
-            required: ['plantName', 'enabled']
-          }
-        }
-      },
-      {
-        type: 'function',
-        function: {
-          name: 'get_garden_report',
-          description: 'Ambil dan bacakan ringkasan lengkap kondisi kebun user',
-          parameters: { type: 'object', properties: {} }
-        }
-      },
-      {
-        type: 'function',
-        function: {
-          name: 'answer_only',
-          description: 'Dipakai kalau user cuma nanya atau ngobrol biasa, tidak perlu aksi apapun',
-          parameters: {
-            type: 'object',
-            properties: {
-              text: { type: 'string', description: 'Teks jawaban untuk disampaikan ke user' }
-            },
-            required: ['text']
-          }
-        }
-      }
-    ];
-
-    // ── 4. Panggil Pateway AI dengan function calling ──────────────
     const apiKey  = process.env.PATEWAY_API_KEY || 'sk-ptw-132WnNefggLa04seTxATdSeHJYX7gpl8Dthou';
     const baseUrl = process.env.PATEWAY_BASE_URL || 'https://api.pateway.ai/v1';
     const model   = process.env.PATEWAY_MODEL || 'gpt-5.6-terra';
 
-    let toolCalls = [];
     let spokenReply = '';
+    let toolCalls = [];
 
     try {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 4500); // 4.5s max timeout
+
       const aiRes = await fetch(`${baseUrl}/chat/completions`, {
         method: 'POST',
         headers: {
@@ -736,87 +864,41 @@ Ringkasan kebun:
             { role: 'system', content: systemPrompt },
             { role: 'user', content: message.trim() },
           ],
-          tools,
-          tool_choice: 'auto',
-          max_tokens: 1024,
+          max_tokens: 150,
         }),
+        signal: controller.signal,
       });
 
-      if (!aiRes.ok) {
-        const errBody = await aiRes.text();
-        throw new Error(`AI API error ${aiRes.status}: ${errBody}`);
-      }
+      clearTimeout(timeoutId);
 
-      const aiData = await aiRes.json();
-      const choice = aiData.choices?.[0];
-
-      if (choice?.message?.tool_calls?.length) {
-        // AI memutuskan untuk memanggil satu atau lebih tools
-        toolCalls = choice.message.tool_calls.map((tc) => ({
-          name: tc.function.name,
-          parameters: (() => {
-            try { return JSON.parse(tc.function.arguments); } catch { return {}; }
-          })(),
-        }));
-
-        // Minta AI generate spoken reply berdasarkan tool yang dipanggil + data laporan
-        // (simple second call, atau bisa pakai teks dari answer_only jika ada)
-        const answerOnlyCall = toolCalls.find((tc) => tc.name === 'answer_only');
-        if (answerOnlyCall) {
-          spokenReply = answerOnlyCall.parameters.text || '';
-          // Filter keluar dari toolCalls karena bukan aksi nyata
-          toolCalls = toolCalls.filter((tc) => tc.name !== 'answer_only');
-        } else {
-          // Untuk aksi lain, minta AI buat kalimat konfirmasi natural
-          const confirmRes = await fetch(`${baseUrl}/chat/completions`, {
-            method: 'POST',
-            headers: {
-              'Authorization': `Bearer ${apiKey}`,
-              'Content-Type': 'application/json',
-            },
-            body: JSON.stringify({
-              model,
-              messages: [
-                { role: 'system', content: 'Kamu adalah Taku, asisten AI Tanamanku yang santai dan ramah. Buat satu kalimat konfirmasi singkat dalam Bahasa Indonesia yang natural untuk tindakan berikut. Maksimal 2 kalimat.' },
-                { role: 'user', content: `Tindakan yang akan dilakukan: ${toolCalls.map(tc => tc.name + ' ' + JSON.stringify(tc.parameters)).join(', ')}. Pesan user: "${message}"` },
-              ],
-              max_tokens: 150,
-            }),
-          });
-          if (confirmRes.ok) {
-            const confirmData = await confirmRes.json();
-            spokenReply = confirmData.choices?.[0]?.message?.content || 'Oke, segera dikerjakan!';
-          } else {
-            spokenReply = 'Oke, segera dikerjakan!';
-          }
-        }
-      } else {
-        // AI tidak panggil tool — ambil teks biasa
-        spokenReply = choice?.message?.content || 'Maaf, saya tidak mengerti. Coba ulangi perintahmu.';
+      if (aiRes.ok) {
+        const aiData = await aiRes.json();
+        spokenReply = aiData.choices?.[0]?.message?.content?.trim() || '';
       }
     } catch (aiErr) {
-      console.error('[takuCommand] AI error:', aiErr);
-      // Fallback: jawab tanpa AI
-      spokenReply = `Maaf ${firstName}, saya sedang tidak bisa terhubung ke AI. Coba lagi sebentar.`;
-      toolCalls = [];
+      console.warn('[takuCommand] AI timeout or error:', aiErr.message);
     }
 
-    // Simpan percakapan ke chat_messages (opsional, untuk riwayat di TakuChatPage)
+    if (!spokenReply) {
+      spokenReply = `Siap ${firstName}! Ada yang bisa saya bantu untuk kebunmu? Kamu bisa minta laporan kebun, siram tanaman, atau cek kondisi sensor.`;
+    }
+
+    // Simpan ke riwayat chat
     try {
       await supabase.from('chat_messages').insert([
         { user_id: userId, role: 'user',      content: message.trim(), tanaman_id: null },
         { user_id: userId, role: 'assistant', content: spokenReply,    tanaman_id: null },
       ]);
     } catch (dbErr) {
-      console.warn('[takuCommand] Gagal simpan chat history:', dbErr.message);
+      console.warn('[takuCommand] DB log info:', dbErr.message);
     }
 
     return res.json({
       success: true,
-      toolCalls,       // Array: [{ name, parameters }]
-      spokenReply,     // String yang akan di-TTS oleh frontend
-      plants,          // Kirim juga data tanaman (dipakai frontend untuk water_plant)
-      report,          // Kirim garden report
+      toolCalls,
+      spokenReply,
+      plants,
+      report,
     });
   } catch (err) {
     console.error('[takuCommand] Error:', err);
