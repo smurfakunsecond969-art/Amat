@@ -90,7 +90,7 @@ async function saveUploadedPhoto(file, plantId, userId, prefix = '') {
  * Bisa kirim text-only atau dengan image_url untuk analisis foto
  */
 async function callAI(messages) {
-  const apiKey = process.env.PATEWAY_API_KEY || 'sk-ptw-132WnNefggLa04seTxATdSeHJYX7gpl8Dthou';
+  const apiKey = process.env.PATEWAY_API_KEY || 'sk-ptw-132WnNlWfyev0g7V9166uSjFc6hDYCBknJeck';
   const baseUrl = process.env.PATEWAY_BASE_URL || 'https://api.pateway.ai/v1';
   const model = process.env.PATEWAY_MODEL || 'gpt-5.6-terra';
 
@@ -103,7 +103,7 @@ async function callAI(messages) {
     body: JSON.stringify({
       model,
       messages,
-      max_tokens: 1024,
+      max_completion_tokens: 1024,
     }),
   });
 
@@ -841,7 +841,7 @@ Nama user: ${firstName}
 Kebun ${firstName}: ${plants.length} tanaman, skor ${report.healthScore}/100.
 ${plantsContext}`;
 
-    const apiKey  = process.env.PATEWAY_API_KEY || 'sk-ptw-132WnNefggLa04seTxATdSeHJYX7gpl8Dthou';
+    const apiKey  = process.env.PATEWAY_API_KEY || 'sk-ptw-132WnNlWfyev0g7V9166uSjFc6hDYCBknJeck';
     const baseUrl = process.env.PATEWAY_BASE_URL || 'https://api.pateway.ai/v1';
     const model   = process.env.PATEWAY_MODEL || 'gpt-5.6-terra';
 
@@ -864,7 +864,7 @@ ${plantsContext}`;
             { role: 'system', content: systemPrompt },
             { role: 'user', content: message.trim() },
           ],
-          max_tokens: 150,
+          max_completion_tokens: 150,
         }),
         signal: controller.signal,
       });
